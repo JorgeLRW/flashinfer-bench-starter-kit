@@ -32,7 +32,7 @@ import triton
 import triton.language as tl
 
 
-# ── Fixed geometry ──────────────────────────────────────────────────────────
+# ── Fixed geometry (def) ─────────────────────────────────────────────
 H = 7168
 I = 2048
 E_GLOBAL = 256
@@ -96,18 +96,24 @@ def kernel(
     S2 = torch.repeat_interleave(S2, BLOCK, dim=2)                    # [EL, H, I]
     W2 = W2_fp32 * S2                                                 # [EL, H, I]
 
+    # ^^ block-scale quantization for GEMMs in fp32
+
     # ────────────────────────────────────────────────────────────────────
     # 2) DeepSeek-V3 no-aux routing
     # ────────────────────────────────────────────────────────────────────
 
+    # **risky simply because we compute assuming bias exists** maybe handle if routing_bias is None
     logits = routing_logits.to(torch.float32)                         # [T, E]
     bias = routing_bias.to(torch.float32).reshape(-1)                 # [E]
 
-    # Sigmoid activations
+    # Sigmoid activations (consider logits + bias for blending)
     s = torch.sigmoid(logits)                                         # [T, E]
     s_with_bias = s + bias                                            # [T, E]
 
+    # ^^ maps each expert logit to an independent score according to the sigmoid (per deepseek)
+
     # Group-level selection (8 groups of 32 experts each)
+    # note: all scored by sum, top 4 groups kept, global top 8 selected
     group_size = E_GLOBAL // N_GROUP                                  # 32
     s_wb_grouped = s_with_bias.view(T, N_GROUP, group_size)           # [T, 8, 32]
 
@@ -158,6 +164,7 @@ def kernel(
         token_idx = torch.nonzero(sel_mask, as_tuple=False).squeeze(1)
 
         # Gather
+        # memcpy heavy, materializes full w matrices
         A_e = A.index_select(0, token_idx)                            # [Tk, H]
         W13_e = W13[le]                                               # [2I, H]
         W2_e = W2[le]                                                 # [H, I]
