@@ -73,6 +73,7 @@ def kernel(
     #   - Remove serial expert loops; batch/fuse expert compute.
     #   - Avoid materializing full dequantized fp32 weights in global memory.
     #   - Favor tiled kernels that maximize data reuse and reduce DRAM transactions.
+    #   - Design tile shapes/ordering for L1/L2 cache residency (cache hot activations and scales).
     #   - Use FP8-friendly matmul paths where supported by target architecture.
 
     T = routing_logits.shape[0]
