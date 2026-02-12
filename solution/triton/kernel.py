@@ -25,6 +25,14 @@ Optimization targets (for the LLM to focus on):
     • Exploit FP8 tensor-core instructions (tl.dot on fp8 operands)
     • Use tiling / shared-memory staging for the two large GEMMs
     • Vectorise the routing / top-k selection
+
+Hardware hints (Hopper/Blackwell-oriented, still useful on Ada):
+    • Prioritise compute-bound kernels by hiding memory latency with overlap
+    • Keep working tiles small enough for strong L1/L2 reuse; avoid full fp32 materialisation
+    • Fuse ops aggressively (dequant + GEMM + activation where possible) to reduce DRAM traffic
+    • Prefer FP8 tensor-core paths with on-the-fly dequant rather than expanding scale tensors
+    • For Hopper/Blackwell targets, design with async global→shared staging in mind (TMA-style flow)
+    • Do not depend on architecture-specific intrinsics in seed code; keep correctness portable
 """
 
 import torch
@@ -61,6 +69,11 @@ def kernel(
     # EVOLVE-BLOCK-START
     # ─── Everything below is the evolution target. ───────────────────────
     # The function signature above MUST stay fixed (DPS contract).
+    # Hardware guidance for mutations:
+    #   - Remove serial expert loops; batch/fuse expert compute.
+    #   - Avoid materializing full dequantized fp32 weights in global memory.
+    #   - Favor tiled kernels that maximize data reuse and reduce DRAM transactions.
+    #   - Use FP8-friendly matmul paths where supported by target architecture.
 
     T = routing_logits.shape[0]
     device = hidden_states.device
