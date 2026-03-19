@@ -23,7 +23,7 @@ from flashinfer_bench import Benchmark, BenchmarkConfig, Solution, TraceSet
 app = modal.App("flashinfer-bench")
 
 trace_volume = modal.Volume.from_name("flashinfer-trace", create_if_missing=True)
-TRACE_SET_PATH = "/data"
+VOL_MOUNT = "/data"
 
 image = (
     modal.Image.debian_slim(python_version="3.12")
@@ -31,13 +31,37 @@ image = (
 )
 
 
-@app.function(image=image, gpu="B200:1", timeout=3600, volumes={TRACE_SET_PATH: trace_volume})
-def run_benchmark(solution: Solution, config: BenchmarkConfig = None) -> dict:
+@app.function(image=image, gpu="B200:1", timeout=3600, volumes={VOL_MOUNT: trace_volume})
+def list_volume_contents() -> str:
+    """Debug: list what's in the volume."""
+    import subprocess
+    result = subprocess.run(["find", VOL_MOUNT, "-maxdepth", "4", "-type", "f"], capture_output=True, text=True)
+    return result.stdout[:5000]
+
+
+@app.function(image=image, gpu="B200:1", timeout=3600, volumes={VOL_MOUNT: trace_volume})
+def run_benchmark(solution: Solution, trace_set_path: str = None, config: BenchmarkConfig = None) -> dict:
     """Run benchmark on Modal B200 and return results."""
+    import os
+
     if config is None:
         config = BenchmarkConfig(warmup_runs=3, iterations=100, num_trials=5)
 
-    trace_set = TraceSet.from_path(TRACE_SET_PATH)
+    # Auto-detect trace set root: find the directory containing 'definitions/'
+    if trace_set_path is None:
+        for candidate in [VOL_MOUNT, os.path.join(VOL_MOUNT, "flashinfer-trace")]:
+            if os.path.isdir(os.path.join(candidate, "definitions")):
+                trace_set_path = candidate
+                break
+        else:
+            # List what's actually there for debugging
+            import subprocess
+            listing = subprocess.run(["find", VOL_MOUNT, "-maxdepth", "3", "-type", "d"],
+                                     capture_output=True, text=True).stdout
+            raise ValueError(f"Cannot find 'definitions/' dir in volume. Contents:\n{listing}")
+
+    print(f"Using trace set path: {trace_set_path}")
+    trace_set = TraceSet.from_path(trace_set_path)
 
     if solution.definition not in trace_set.definitions:
         raise ValueError(f"Definition '{solution.definition}' not found in trace set")
@@ -116,6 +140,12 @@ def main():
 
     print("\nRunning benchmark on Modal B200...")
     results = run_benchmark.remote(solution)
+
+    if not results:
+        print("No results returned!")
+        return
+
+    print_results(results)
 
     if not results:
         print("No results returned!")

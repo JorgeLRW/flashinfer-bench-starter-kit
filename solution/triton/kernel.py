@@ -1,15 +1,15 @@
 """
-FlashInfer fused_moe Triton Kernel — Seed Implementation
-=========================================================
+FlashInfer fused_moe Triton Kernel — Optimized Implementation v2
+================================================================
 Track:  moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048
 Model:  DeepSeek-V3 / DeepSeek-R1
 
-This is the **seed / initial program** for OpenEvolve.  It implements the full
-fused MoE operation in plain PyTorch (correct but slow).  OpenEvolve will
-iteratively evolve this into high-performance Triton kernels.
-
-The function signature uses Destination Passing Style (DPS):
-    kernel(input1, …, inputN, output)  — writes result into pre-allocated output.
+Optimizations (numerically identical to reference):
+  1. Reshape-based block-scale dequant (no repeat_interleave — zero-copy views)
+  2. Per-expert lazy weight dequant (not all 32 upfront — saves ~15 GB peak)
+  3. Sorted token-to-expert mapping (batch-build, no per-expert .any() scan)
+  4. Pre-gathered per-expert weight slices (reduce indexing overhead)
+  5. F.silu fused activation
 
 Geometry (constants for this definition):
     H  = 7168   (hidden_size)
@@ -18,26 +18,17 @@ Geometry (constants for this definition):
     EL = 32     (num_local_experts)
     BLOCK = 128 (quantisation block size)
     TOP_K = 8, N_GROUP = 8, TOPK_GROUP = 4  (routing)
-
-Optimization targets (for the LLM to focus on):
-    • Replace the per-expert Python loop with fused Triton kernels
-    • Fuse dequantisation into the GEMMs
-    • Exploit FP8 tensor-core instructions (tl.dot on fp8 operands)
-    • Use tiling / shared-memory staging for the two large GEMMs
-    • Vectorise the routing / top-k selection
-
-Hardware hints (Hopper/Blackwell-oriented, still useful on Ada):
-    • Prioritise compute-bound kernels by hiding memory latency with overlap
-    • Keep working tiles small enough for strong L1/L2 reuse; avoid full fp32 materialisation
-    • Fuse ops aggressively (dequant + GEMM + activation where possible) to reduce DRAM traffic
-    • Prefer FP8 tensor-core paths with on-the-fly dequant rather than expanding scale tensors
-    • For Hopper/Blackwell targets, design with async global→shared staging in mind (TMA-style flow)
-    • Do not depend on architecture-specific intrinsics in seed code; keep correctness portable
 """
 
 import torch
-import triton
-import triton.language as tl
+import torch.nn.functional as F
+
+try:
+    import triton
+    import triton.language as tl
+except Exception:
+    triton = None
+    tl = None
 
 
 # ── Fixed geometry (def) ─────────────────────────────────────────────
@@ -49,6 +40,11 @@ BLOCK = 128
 TOP_K = 8
 N_GROUP = 8
 TOPK_GROUP = 4
+
+# Precomputed block counts
+_NH = H // BLOCK         # 56
+_NG1 = (2 * I) // BLOCK  # 32
+_NI = I // BLOCK          # 16
 
 
 def kernel(
@@ -67,139 +63,121 @@ def kernel(
     """FP8 block-scale fused MoE with DeepSeek-V3 no-aux routing (DPS)."""
 
     # EVOLVE-BLOCK-START
-    # ─── Everything below is the evolution target. ───────────────────────
-    # The function signature above MUST stay fixed (DPS contract).
-    # Hardware guidance for mutations:
-    #   - Remove serial expert loops; batch/fuse expert compute.
-    #   - Avoid materializing full dequantized fp32 weights in global memory.
-    #   - Favor tiled kernels that maximize data reuse and reduce DRAM transactions.
-    #   - Design tile shapes/ordering for L1/L2 cache residency (cache hot activations and scales).
-    #   - Use FP8-friendly matmul paths where supported by target architecture.
-
     T = routing_logits.shape[0]
     device = hidden_states.device
 
     # ────────────────────────────────────────────────────────────────────
-    # 1) FP8 block-scale dequantisation
+    # 1) Dequant hidden states via reshape (no repeat_interleave)
+    #    view [T, 56, 128] × scale [T, 56, 1] → [T, H]  fp32
     # ────────────────────────────────────────────────────────────────────
-
-    # Hidden states: [T, H], scale: [H/128, T]  (transposed block layout)
-    A_fp32 = hidden_states.to(torch.float32)                          # [T, H]
-    A_scale = hidden_states_scale.to(torch.float32)                   # [H/128, T]
-    A_scale_TH = A_scale.permute(1, 0).contiguous()                   # [T, H/128]
-    A_scale_expanded = (
-        A_scale_TH
-        .unsqueeze(-1)
-        .expand(T, H // BLOCK, BLOCK)
-        .reshape(T, H)
-        .contiguous()
-    )
-    A = A_fp32 * A_scale_expanded                                     # [T, H]
-
-    # W13 (gate+up): [EL, 2I, H], scale: [EL, 2I/128, H/128]
-    W13_fp32 = gemm1_weights.to(torch.float32)
-    S13 = gemm1_weights_scale.to(torch.float32)
-    S13 = torch.repeat_interleave(S13, BLOCK, dim=1)                  # [EL, 2I, H/128]
-    S13 = torch.repeat_interleave(S13, BLOCK, dim=2)                  # [EL, 2I, H]
-    W13 = W13_fp32 * S13                                              # [EL, 2I, H]
-
-    # W2 (down): [EL, H, I], scale: [EL, H/128, I/128]
-    W2_fp32 = gemm2_weights.to(torch.float32)
-    S2 = gemm2_weights_scale.to(torch.float32)
-    S2 = torch.repeat_interleave(S2, BLOCK, dim=1)                    # [EL, H, I/128]
-    S2 = torch.repeat_interleave(S2, BLOCK, dim=2)                    # [EL, H, I]
-    W2 = W2_fp32 * S2                                                 # [EL, H, I]
-
-    # ^^ block-scale quantization for GEMMs in fp32
+    scale_t = hidden_states_scale.permute(1, 0).contiguous()  # [T, 56]
+    A = (
+        hidden_states.to(torch.float32).view(T, _NH, BLOCK)
+        * scale_t.unsqueeze(2)
+    ).reshape(T, H)                                           # [T, H] fp32
 
     # ────────────────────────────────────────────────────────────────────
-    # 2) DeepSeek-V3 no-aux routing
+    # 2) DeepSeek-V3 no-aux routing (fp32 throughout)
     # ────────────────────────────────────────────────────────────────────
-
-    # **risky simply because we compute assuming bias exists** maybe handle if routing_bias is None
-    logits = routing_logits.to(torch.float32)                         # [T, E]
-    bias = routing_bias.to(torch.float32).reshape(-1)                 # [E]
-
-    # Sigmoid activations (consider logits + bias for blending)
-    s = torch.sigmoid(logits)                                         # [T, E]
-    s_with_bias = s + bias                                            # [T, E]
-
-    # ^^ maps each expert logit to an independent score according to the sigmoid (per deepseek)
-
-    # Group-level selection (8 groups of 32 experts each)
-    # note: all scored by sum, top 4 groups kept, global top 8 selected
-    group_size = E_GLOBAL // N_GROUP                                  # 32
-    s_wb_grouped = s_with_bias.view(T, N_GROUP, group_size)           # [T, 8, 32]
-
-    # Per-group score = sum of top-2 values
-    top2_vals, _ = torch.topk(s_wb_grouped, k=2, dim=2, largest=True, sorted=False)
-    group_scores = top2_vals.sum(dim=2)                               # [T, 8]
-
-    # Keep top-4 groups
-    _, group_idx = torch.topk(group_scores, k=TOPK_GROUP, dim=1, largest=True, sorted=False)
-    group_mask = torch.zeros_like(group_scores)
-    group_mask.scatter_(1, group_idx, 1.0)
-    score_mask = (
-        group_mask
-        .unsqueeze(2)
-        .expand(T, N_GROUP, group_size)
-        .reshape(T, E_GLOBAL)
+    logits = routing_logits.float()
+    bias = (
+        routing_bias.float().reshape(-1)
+        if routing_bias is not None
+        else torch.zeros(E_GLOBAL, dtype=torch.float32, device=device)
     )
 
-    # Global top-8 experts within kept groups
+    s = torch.sigmoid(logits)                              # [T, E]
+    s_wb = s + bias                                        # [T, E]
+
+    # Group-level: 8 groups of 32 experts, top-2 per group → group score
+    group_size = E_GLOBAL // N_GROUP
+    s_grouped = s_wb.view(T, N_GROUP, group_size)
+    top2_vals, _ = s_grouped.topk(2, dim=2, largest=True, sorted=False)
+    g_scores = top2_vals.sum(2)                            # [T, 8]
+    _, g_idx = g_scores.topk(TOPK_GROUP, dim=1, sorted=False)
+
+    g_mask = torch.zeros(T, N_GROUP, dtype=torch.float32, device=device)
+    g_mask.scatter_(1, g_idx, 1.0)
+    s_mask = g_mask.unsqueeze(2).expand(-1, -1, group_size).reshape(T, E_GLOBAL)
+
+    # Global top-8 within kept groups
     neg_inf = torch.finfo(torch.float32).min
-    scores_pruned = s_with_bias.masked_fill(score_mask == 0, neg_inf)
-    _, topk_idx = torch.topk(scores_pruned, k=TOP_K, dim=1, largest=True, sorted=False)
+    scores_pruned = s_wb.masked_fill(s_mask == 0, neg_inf)
+    _, topk_idx = scores_pruned.topk(TOP_K, dim=1, sorted=False)
 
-    # Combination weights (normalised sigmoid WITHOUT bias, then scaled)
+    # Normalised weights (sigmoid WITHOUT bias, scaled)
     M = torch.zeros_like(s)
     M.scatter_(1, topk_idx, 1.0)
-    weights = s * M                                                   # [T, E]
-    weights_sum = weights.sum(dim=1, keepdim=True) + 1e-20
-    weights = (weights / weights_sum) * routed_scaling_factor         # [T, E]
+    weights = s * M
+    weights = (weights / (weights.sum(1, keepdim=True) + 1e-20)) * routed_scaling_factor
 
     # ────────────────────────────────────────────────────────────────────
-    # 3) Per-expert compute: GEMM1 → SwiGLU → GEMM2, weighted accumulate
+    # 3) GPU-vectorised token→expert mapping (no Python loop over T)
     # ────────────────────────────────────────────────────────────────────
-
-    result = torch.zeros((T, H), dtype=torch.float32, device=device)
     local_start = int(local_expert_offset)
+    local_end = local_start + E_LOCAL
+
+    # Flatten topk_idx [T, TOP_K] → [T*TOP_K] with corresponding token ids
+    flat_expert = topk_idx.reshape(-1)                      # [T*TOP_K]
+    flat_token  = torch.arange(T, device=device).unsqueeze(1).expand(-1, TOP_K).reshape(-1)
+
+    # Keep only assignments to local experts
+    local_mask = (flat_expert >= local_start) & (flat_expert < local_end)
+    local_expert_flat = flat_expert[local_mask] - local_start  # local expert index [0, EL)
+    local_token_flat  = flat_token[local_mask]                 # token indices
+
+    # Sort by expert for grouped processing
+    sort_idx = local_expert_flat.argsort()
+    sorted_experts = local_expert_flat[sort_idx]
+    sorted_tokens  = local_token_flat[sort_idx]
+
+    # Find boundaries per expert using searchsorted
+    expert_ids = torch.arange(E_LOCAL, device=device)
+    starts = torch.searchsorted(sorted_experts, expert_ids)
+    ends   = torch.searchsorted(sorted_experts, expert_ids, right=True)
+
+    # ────────────────────────────────────────────────────────────────────
+    # 4) Per-expert compute: lazy dequant (fp32) → GEMM → SwiGLU → accum
+    # ────────────────────────────────────────────────────────────────────
+    result = torch.zeros((T, H), dtype=torch.float32, device=device)
 
     for le in range(E_LOCAL):
+        s_i = starts[le].item()
+        e_i = ends[le].item()
+        if s_i == e_i:
+            continue
+
         ge = local_start + le
-        if ge < 0 or ge >= E_GLOBAL:
-            continue
+        tidx = sorted_tokens[s_i:e_i]                      # already on GPU
 
-        # Tokens that selected this expert
-        sel_mask = (topk_idx == ge).any(dim=1)                        # [T] bool
-        if not sel_mask.any():
-            continue
+        # Gather activations for this expert's tokens
+        A_e = A[tidx]                                       # [Tk, H] fp32
 
-        token_idx = torch.nonzero(sel_mask, as_tuple=False).squeeze(1)
+        # ── GEMM1: reshape-based lazy dequant (fp32) ──
+        W1 = (
+            gemm1_weights[le].float().view(_NG1, BLOCK, _NH, BLOCK)
+            * gemm1_weights_scale[le].float().view(_NG1, 1, _NH, 1)
+        ).reshape(2 * I, H)                                 # [4096, H] fp32
 
-        # Gather
-        # memcpy heavy, materializes full w matrices
-        A_e = A.index_select(0, token_idx)                            # [Tk, H]
-        W13_e = W13[le]                                               # [2I, H]
-        W2_e = W2[le]                                                 # [H, I]
+        G1 = A_e.mm(W1.t())                                # [Tk, 4096]
 
-        # GEMM1: [Tk, H] @ [H, 2I] → [Tk, 2I]
-        G1 = A_e.matmul(W13_e.t())
+        # ── SwiGLU ──
+        gate = G1[:, :I]
+        up   = G1[:, I:]
+        C = F.silu(up) * gate                               # [Tk, 2048] fp32
 
-        # SwiGLU
-        X1 = G1[:, :I]                                                # gate
-        X2 = G1[:, I:]                                                # up
-        silu_X2 = X2 * torch.sigmoid(X2)
-        C = silu_X2 * X1                                              # [Tk, I]
+        # ── GEMM2: reshape-based lazy dequant (fp32) ──
+        W2 = (
+            gemm2_weights[le].float().view(_NH, BLOCK, _NI, BLOCK)
+            * gemm2_weights_scale[le].float().view(_NH, 1, _NI, 1)
+        ).reshape(H, I)                                     # [H, I] fp32
 
-        # GEMM2: [Tk, I] @ [I, H] → [Tk, H]
-        O = C.matmul(W2_e.t())
+        O = C.mm(W2.t())                                    # [Tk, H]
 
-        # Weighted accumulate
-        w_tok = weights.index_select(0, token_idx)[:, ge].unsqueeze(1)
-        result.index_add_(0, token_idx, O * w_tok)
+        # ── Weighted accumulate ──
+        w_tok = weights[tidx, ge].unsqueeze(1)              # [Tk, 1]
+        result.index_add_(0, tidx, O * w_tok)
 
-    # Write to DPS output
     output.copy_(result.to(torch.bfloat16))
 
     # EVOLVE-BLOCK-END

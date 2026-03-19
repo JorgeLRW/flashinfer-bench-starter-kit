@@ -77,7 +77,7 @@ author = "team-name"              # Team/author name
 
 [build]
 language = "triton"               # triton | cuda
-entry_point = "kernel"            # Kernel function name
+entry_point = "kernel.py::kernel" # Entry point: <file_path>::<function_name>
 ```
 
 ### 5. Implement Your Kernel

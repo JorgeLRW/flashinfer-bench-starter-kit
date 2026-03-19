@@ -1,6 +1,11 @@
 # FlashInfer Competition
 solution.json
 
+# OpenEvolve outputs (large checkpoint/program data)
+**/openevolve_output/
+**/checkpoints/
+**/programs/*.json
+
 # CUDA build artifacts
 *.o
 *.obj
