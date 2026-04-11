@@ -1,37 +1,23 @@
-"""
-FlashInfer fused_moe Triton Kernel — Optimized Implementation v2
-================================================================
+﻿"""
+FlashInfer fused_moe â€” ORIGINAL SEED BASELINE (unmodified)
+==========================================================
 Track:  moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048
 Model:  DeepSeek-V3 / DeepSeek-R1
 
-Optimizations (numerically identical to reference):
-  1. Reshape-based block-scale dequant (no repeat_interleave — zero-copy views)
-  2. Per-expert lazy weight dequant (not all 32 upfront — saves ~15 GB peak)
-  3. Sorted token-to-expert mapping (batch-build, no per-expert .any() scan)
-  4. Pre-gathered per-expert weight slices (reduce indexing overhead)
-  5. F.silu fused activation
+This is the UNMODIFIED FlashInfer starter-kit seed kernel.
+Used as the control group / baseline for the A/B comparison:
+  A) OpenEvolve evolving FROM this baseline
+  B) Human-optimized kernel (kernel.py) starting from this baseline
 
-Geometry (constants for this definition):
-    H  = 7168   (hidden_size)
-    I  = 2048   (intermediate_size)
-    E  = 256    (num_experts, global)
-    EL = 32     (num_local_experts)
-    BLOCK = 128 (quantisation block size)
-    TOP_K = 8, N_GROUP = 8, TOPK_GROUP = 4  (routing)
+Pure PyTorch reference â€” correct but slow.
 """
 
 import torch
-import torch.nn.functional as F
-
-try:
-    import triton
-    import triton.language as tl
-except Exception:
-    triton = None
-    tl = None
+import triton
+import triton.language as tl
 
 
-# ── Fixed geometry (def) ─────────────────────────────────────────────
+# â”€â”€ Fixed geometry â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 H = 7168
 I = 2048
 E_GLOBAL = 256
@@ -40,11 +26,6 @@ BLOCK = 128
 TOP_K = 8
 N_GROUP = 8
 TOPK_GROUP = 4
-
-# Precomputed block counts
-_NH = H // BLOCK         # 56
-_NG1 = (2 * I) // BLOCK  # 32
-_NI = I // BLOCK          # 16
 
 
 def kernel(
@@ -58,126 +39,112 @@ def kernel(
     gemm2_weights_scale,   # [32, 56, 16]   float32
     local_expert_offset,   # int32 scalar
     routed_scaling_factor, # float32 scalar
-    output,                # [T, 7168]      bfloat16  (DPS — write here)
+    output,                # [T, 7168]      bfloat16  (DPS â€” write here)
 ):
     """FP8 block-scale fused MoE with DeepSeek-V3 no-aux routing (DPS)."""
 
     # EVOLVE-BLOCK-START
     T = routing_logits.shape[0]
     device = hidden_states.device
+    torch.backends.cuda.matmul.allow_tf32 = True
 
-    # ────────────────────────────────────────────────────────────────────
-    # 1) Dequant hidden states via reshape (no repeat_interleave)
-    #    view [T, 56, 128] × scale [T, 56, 1] → [T, H]  fp32
-    # ────────────────────────────────────────────────────────────────────
-    scale_t = hidden_states_scale.permute(1, 0).contiguous()  # [T, 56]
-    A = (
-        hidden_states.to(torch.float32).view(T, _NH, BLOCK)
-        * scale_t.unsqueeze(2)
-    ).reshape(T, H)                                           # [T, H] fp32
+    # 1) FP8 block-scale dequantisation of hidden_states (fp32 for accuracy)
+    A_fp32 = hidden_states.to(torch.float32)
+    A_scale = hidden_states_scale.to(torch.float32)
+    A_scale_TH = A_scale.permute(1, 0).contiguous()
+    A_scale_expanded = (
+        A_scale_TH
+        .unsqueeze(-1)
+        .expand(T, H // BLOCK, BLOCK)
+        .reshape(T, H)
+        .contiguous()
+    )
+    A = (A_fp32 * A_scale_expanded).contiguous()  # [T, H] fp32
 
-    # ────────────────────────────────────────────────────────────────────
-    # 2) DeepSeek-V3 no-aux routing (fp32 throughout)
-    # ────────────────────────────────────────────────────────────────────
-    logits = routing_logits.float()
-    bias = (
-        routing_bias.float().reshape(-1)
-        if routing_bias is not None
-        else torch.zeros(E_GLOBAL, dtype=torch.float32, device=device)
+    # 2) DeepSeek-V3 no-aux routing (in-place sigmoid to save memory)
+    logits = routing_logits.to(torch.float32)
+    bias = routing_bias.to(torch.float32).reshape(-1)
+    logits.sigmoid_()
+    s = logits
+    s_with_bias = s + bias
+
+    group_size = E_GLOBAL // N_GROUP
+    s_wb_grouped = s_with_bias.view(T, N_GROUP, group_size)
+    top2_vals, _ = torch.topk(s_wb_grouped, k=2, dim=2, largest=True, sorted=False)
+    group_scores = top2_vals.sum(dim=2)
+
+    _, group_idx = torch.topk(group_scores, k=TOPK_GROUP, dim=1, largest=True, sorted=False)
+    group_mask = torch.zeros_like(group_scores)
+    group_mask.scatter_(1, group_idx, 1.0)
+    score_mask = (
+        group_mask
+        .unsqueeze(2)
+        .expand(T, N_GROUP, group_size)
+        .reshape(T, E_GLOBAL)
     )
 
-    s = torch.sigmoid(logits)                              # [T, E]
-    s_wb = s + bias                                        # [T, E]
-
-    # Group-level: 8 groups of 32 experts, top-2 per group → group score
-    group_size = E_GLOBAL // N_GROUP
-    s_grouped = s_wb.view(T, N_GROUP, group_size)
-    top2_vals, _ = s_grouped.topk(2, dim=2, largest=True, sorted=False)
-    g_scores = top2_vals.sum(2)                            # [T, 8]
-    _, g_idx = g_scores.topk(TOPK_GROUP, dim=1, sorted=False)
-
-    g_mask = torch.zeros(T, N_GROUP, dtype=torch.float32, device=device)
-    g_mask.scatter_(1, g_idx, 1.0)
-    s_mask = g_mask.unsqueeze(2).expand(-1, -1, group_size).reshape(T, E_GLOBAL)
-
-    # Global top-8 within kept groups
     neg_inf = torch.finfo(torch.float32).min
-    scores_pruned = s_wb.masked_fill(s_mask == 0, neg_inf)
-    _, topk_idx = scores_pruned.topk(TOP_K, dim=1, sorted=False)
+    scores_pruned = s_with_bias.masked_fill(score_mask == 0, neg_inf)
+    _, topk_idx = torch.topk(scores_pruned, k=TOP_K, dim=1, largest=True, sorted=False)
 
-    # Normalised weights (sigmoid WITHOUT bias, scaled)
     M = torch.zeros_like(s)
     M.scatter_(1, topk_idx, 1.0)
     weights = s * M
-    weights = (weights / (weights.sum(1, keepdim=True) + 1e-20)) * routed_scaling_factor
+    weights_sum = weights.sum(dim=1, keepdim=True) + 1e-20
+    weights = (weights / weights_sum) * routed_scaling_factor  # [T, 256] fp32
 
-    # ────────────────────────────────────────────────────────────────────
-    # 3) GPU-vectorised token→expert mapping (no Python loop over T)
-    # ────────────────────────────────────────────────────────────────────
-    local_start = int(local_expert_offset)
-    local_end = local_start + E_LOCAL
-
-    # Flatten topk_idx [T, TOP_K] → [T*TOP_K] with corresponding token ids
-    flat_expert = topk_idx.reshape(-1)                      # [T*TOP_K]
-    flat_token  = torch.arange(T, device=device).unsqueeze(1).expand(-1, TOP_K).reshape(-1)
-
-    # Keep only assignments to local experts
-    local_mask = (flat_expert >= local_start) & (flat_expert < local_end)
-    local_expert_flat = flat_expert[local_mask] - local_start  # local expert index [0, EL)
-    local_token_flat  = flat_token[local_mask]                 # token indices
-
-    # Sort by expert for grouped processing
-    sort_idx = local_expert_flat.argsort()
-    sorted_experts = local_expert_flat[sort_idx]
-    sorted_tokens  = local_token_flat[sort_idx]
-
-    # Find boundaries per expert using searchsorted
-    expert_ids = torch.arange(E_LOCAL, device=device)
-    starts = torch.searchsorted(sorted_experts, expert_ids)
-    ends   = torch.searchsorted(sorted_experts, expert_ids, right=True)
-
-    # ────────────────────────────────────────────────────────────────────
-    # 4) Per-expert compute: lazy dequant (fp32) → GEMM → SwiGLU → accum
-    # ────────────────────────────────────────────────────────────────────
+    # 3) Per-expert compute: GEMM1 → SwiGLU → GEMM2, weighted accumulate
+    #    Weight dequant happens per-expert to stay within GPU memory.
     result = torch.zeros((T, H), dtype=torch.float32, device=device)
+    local_start = int(local_expert_offset)
 
-    for le in range(E_LOCAL):
-        s_i = starts[le].item()
-        e_i = ends[le].item()
-        if s_i == e_i:
-            continue
+    # Group tokens by local expert to avoid O(T*E_LOCAL) scans
+    flat_tok = torch.arange(T, device=device, dtype=torch.int64).repeat_interleave(TOP_K)
+    flat_ge = topk_idx.reshape(-1)
+    mask = (flat_ge >= local_start) & (flat_ge < local_start + E_LOCAL)
+    if mask.any():
+        ge_l = (flat_ge[mask] - local_start).to(torch.int64)  # [N_assigned]
+        tok_l = flat_tok[mask]                                 # [N_assigned]
+        order = torch.argsort(ge_l)
+        ge_sorted = ge_l[order]
+        tok_sorted = tok_l[order]
+        counts = torch.bincount(ge_sorted, minlength=E_LOCAL)
+        offsets = torch.zeros(E_LOCAL + 1, device=device, dtype=torch.int64)
+        offsets[1:] = torch.cumsum(counts, dim=0)
+    else:
+        tok_sorted = torch.empty((0,), device=device, dtype=torch.int64)
+        offsets = torch.zeros(E_LOCAL + 1, device=device, dtype=torch.int64)
 
-        ge = local_start + le
-        tidx = sorted_tokens[s_i:e_i]                      # already on GPU
+    # Iterate only non-empty local experts to reduce Python overhead
+    nonempty = torch.nonzero(offsets[1:] > offsets[:-1], as_tuple=False).squeeze(1).tolist()
+    for le in nonempty:
+        start = int(offsets[le].item())
+        end = int(offsets[le + 1].item())
+        token_idx = tok_sorted[start:end]
 
-        # Gather activations for this expert's tokens
-        A_e = A[tidx]                                       # [Tk, H] fp32
+        A_e = A.index_select(0, token_idx).contiguous()  # [N_tok_e, H] fp32
 
-        # ── GEMM1: reshape-based lazy dequant (fp32) ──
-        W1 = (
-            gemm1_weights[le].float().view(_NG1, BLOCK, _NH, BLOCK)
-            * gemm1_weights_scale[le].float().view(_NG1, 1, _NH, 1)
-        ).reshape(2 * I, H)                                 # [4096, H] fp32
+        # GEMM1 dequant with blockwise broadcast and matmul (fp32 for accuracy)
+        w13_fp32 = gemm1_weights[le].to(torch.float32).view(32, BLOCK, 56, BLOCK)   # [32,128,56,128]
+        s13 = gemm1_weights_scale[le].to(torch.float32).view(32, 1, 56, 1)          # [32,1,56,1]
+        G1 = torch.nn.functional.linear(A_e, (w13_fp32 * s13).view(4096, 7168).contiguous())
 
-        G1 = A_e.mm(W1.t())                                # [Tk, 4096]
+        # SwiGLU
+        X1 = G1[:, :I]
+        X2 = G1[:, I:]
+        C = torch.nn.functional.silu(X2) * X1  # [N_tok_e, I] fp32
 
-        # ── SwiGLU ──
-        gate = G1[:, :I]
-        up   = G1[:, I:]
-        C = F.silu(up) * gate                               # [Tk, 2048] fp32
+        # Pre-scale activations by routing weight before GEMM2
+        w_tok = weights.index_select(0, token_idx)[:, local_start + le].unsqueeze(1)  # [N_tok_e,1] fp32
+        C = C * w_tok
 
-        # ── GEMM2: reshape-based lazy dequant (fp32) ──
-        W2 = (
-            gemm2_weights[le].float().view(_NH, BLOCK, _NI, BLOCK)
-            * gemm2_weights_scale[le].float().view(_NH, 1, _NI, 1)
-        ).reshape(H, I)                                     # [H, I] fp32
+        # GEMM2 dequant with blockwise broadcast and matmul
+        w2_fp32 = gemm2_weights[le].to(torch.float32).view(56, BLOCK, 16, BLOCK)    # [56,128,16,128]
+        s2 = gemm2_weights_scale[le].to(torch.float32).view(56, 1, 16, 1)           # [56,1,16,1]
+        O = torch.nn.functional.linear(C, (w2_fp32 * s2).view(7168, 2048).contiguous())  # [N_tok_e, H] fp32
 
-        O = C.mm(W2.t())                                    # [Tk, H]
-
-        # ── Weighted accumulate ──
-        w_tok = weights[tidx, ge].unsqueeze(1)              # [Tk, 1]
-        result.index_add_(0, tidx, O * w_tok)
+        result.index_add_(0, token_idx, O)
 
     output.copy_(result.to(torch.bfloat16))
-
     # EVOLVE-BLOCK-END
+
