@@ -1,5 +1,8 @@
 # FlashInfer Competition
 solution.json
+solution/triton/human_*
+solution/triton/naive_*
+solution/triton/kernel_baseline.py
 
 # OpenEvolve outputs (large checkpoint/program data)
 **/openevolve_output/
